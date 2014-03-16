@@ -162,7 +162,7 @@ class OpenIdMixin(object):
         url = self._OPENID_ENDPOINT
         if http_client is None:
             http_client = self.get_auth_http_client()
-        http_client.fetch(url, self.async_callback(
+        http_client.fetch(url, functools.partial(
             self._on_authentication_verified, callback),
             method="POST", body=urllib_parse.urlencode(args))
 
@@ -334,7 +334,7 @@ class OAuthMixin(object):
             http_client.fetch(
                 self._oauth_request_token_url(callback_uri=callback_uri,
                                               extra_params=extra_params),
-                self.async_callback(
+                functools.partial(
                     self._on_request_token,
                     self._OAUTH_AUTHORIZE_URL,
                     callback_uri,
@@ -342,7 +342,7 @@ class OAuthMixin(object):
         else:
             http_client.fetch(
                 self._oauth_request_token_url(),
-                self.async_callback(
+                functools.partial(
                     self._on_request_token, self._OAUTH_AUTHORIZE_URL,
                     callback_uri,
                     callback))
@@ -379,7 +379,7 @@ class OAuthMixin(object):
         if http_client is None:
             http_client = self.get_auth_http_client()
         http_client.fetch(self._oauth_access_token_url(token),
-                          self.async_callback(self._on_access_token, callback))
+                          functools.partial(self._on_access_token, callback))
 
     def _oauth_request_token_url(self, callback_uri=None, extra_params=None):
         consumer_token = self._oauth_consumer_token()
@@ -456,7 +456,7 @@ class OAuthMixin(object):
 
         access_token = _oauth_parse_response(response.body)
         self._oauth_get_user_future(access_token).add_done_callback(
-            self.async_callback(self._on_oauth_get_user, access_token, future))
+            functools.partial(self._on_oauth_get_user, access_token, future))
 
     def _oauth_consumer_token(self):
         """Subclasses must override this to return their OAuth consumer keys.
@@ -642,7 +642,7 @@ class TwitterMixin(OAuthMixin):
         """
         http = self.get_auth_http_client()
         http.fetch(self._oauth_request_token_url(callback_uri=callback_uri),
-                   self.async_callback(
+                   functools.partial(
                        self._on_request_token, self._OAUTH_AUTHENTICATE_URL,
                        None, callback))
 
@@ -701,7 +701,7 @@ class TwitterMixin(OAuthMixin):
         if args:
             url += "?" + urllib_parse.urlencode(args)
         http = self.get_auth_http_client()
-        http_callback = self.async_callback(self._on_twitter_request, callback)
+        http_callback = functools.partial(self._on_twitter_request, callback)
         if post_args is not None:
             http.fetch(url, method="POST", body=urllib_parse.urlencode(post_args),
                        callback=http_callback)
@@ -820,7 +820,7 @@ class FriendFeedMixin(OAuthMixin):
             args.update(oauth)
         if args:
             url += "?" + urllib_parse.urlencode(args)
-        callback = self.async_callback(self._on_friendfeed_request, callback)
+        callback = functools.partial(self._on_friendfeed_request, callback)
         http = self.get_auth_http_client()
         if post_args is not None:
             http.fetch(url, method="POST", body=urllib_parse.urlencode(post_args),
@@ -932,7 +932,7 @@ class GoogleMixin(OpenIdMixin, OAuthMixin):
             http = self.get_auth_http_client()
             token = dict(key=token, secret="")
             http.fetch(self._oauth_access_token_url(token),
-                       self.async_callback(self._on_access_token, callback))
+                       functools.partial(self._on_access_token, callback))
         else:
             chain_future(OpenIdMixin.get_authenticated_user(self),
                          callback)
@@ -988,7 +988,7 @@ class GoogleOAuth2Mixin(OAuth2Mixin):
         })
 
         http.fetch(self._OAUTH_ACCESS_TOKEN_URL,
-                  self.async_callback(self._on_access_token, callback),
+                  functools.partial(self._on_access_token, callback),
                   method="POST", headers={'Content-Type': 'application/x-www-form-urlencoded'}, body=body)
 
     def _on_access_token(self, future, response):
@@ -1029,7 +1029,7 @@ class FacebookMixin(object):
             @tornado.web.asynchronous
             def get(self):
                 if self.get_argument("session", None):
-                    self.get_authenticated_user(self.async_callback(self._on_auth))
+                    self.get_authenticated_user(self._on_auth)
                     return
                 yield self.authenticate_redirect()
 
@@ -1115,7 +1115,7 @@ class FacebookMixin(object):
         session = escape.json_decode(self.get_argument("session"))
         self.facebook_request(
             method="facebook.users.getInfo",
-            callback=self.async_callback(
+            callback=functools.partial(
                 self._on_get_user_info, callback, session),
             session_key=session["session_key"],
             uids=session["uid"],
@@ -1141,7 +1141,7 @@ class FacebookMixin(object):
                 def get(self):
                     self.facebook_request(
                         method="stream.get",
-                        callback=self.async_callback(self._on_stream),
+                        callback=self._on_stream,
                         session_key=self.current_user["session_key"])
 
                 def _on_stream(self, stream):
@@ -1165,7 +1165,7 @@ class FacebookMixin(object):
         url = "http://api.facebook.com/restserver.php?" + \
             urllib_parse.urlencode(args)
         http = self.get_auth_http_client()
-        http.fetch(url, callback=self.async_callback(
+        http.fetch(url, callback=functools.partial(
             self._parse_response, callback))
 
     def _on_get_user_info(self, callback, session, users):
@@ -1264,8 +1264,8 @@ class FacebookGraphMixin(OAuth2Mixin):
             fields.update(extra_fields)
 
         http.fetch(self._oauth_request_token_url(**args),
-                   self.async_callback(self._on_access_token, redirect_uri, client_id,
-                                       client_secret, callback, fields))
+                   functools.partial(self._on_access_token, redirect_uri, client_id,
+                                     client_secret, callback, fields))
 
     def _on_access_token(self, redirect_uri, client_id, client_secret,
                          future, fields, response):
@@ -1281,7 +1281,7 @@ class FacebookGraphMixin(OAuth2Mixin):
 
         self.facebook_request(
             path="/me",
-            callback=self.async_callback(
+            callback=functools.partial(
                 self._on_get_user_info, future, session, fields),
             access_token=session["access_token"],
             fields=",".join(fields)
@@ -1349,7 +1349,7 @@ class FacebookGraphMixin(OAuth2Mixin):
 
         if all_args:
             url += "?" + urllib_parse.urlencode(all_args)
-        callback = self.async_callback(self._on_facebook_request, callback)
+        callback = functools.partial(self._on_facebook_request, callback)
         http = self.get_auth_http_client()
         if post_args is not None:
             http.fetch(url, method="POST", body=urllib_parse.urlencode(post_args),
