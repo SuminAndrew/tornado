@@ -1387,8 +1387,47 @@ class DefaultHostMatchingTest(WebTestCase):
         response = self.fetch("/baz")
         self.assertEqual(response.code, 404)
 
-        response = self.fetch("/foo", follow_redirects=False, headers={"X-Real-Ip": "127.0.0.1"})
-        self.assertEqual(response.code, 301)
+        response = self.fetch("/foo", headers={"X-Real-Ip": "127.0.0.1"})
+        self.assertEqual(response.code, 404)
+
+        self.app.default_host = "www.test.com"
+
+        response = self.fetch("/baz")
+        self.assertEqual(response.body, b"[2]")
+
+
+@wsgi_safe
+class DefaultHostMatchingTest(WebTestCase):
+    class Handler(RequestHandler):
+        def initialize(self, reply):
+            self.reply = reply
+
+        def get(self):
+            self.write(self.reply)
+
+    def get_handlers(self):
+        return []
+
+    def get_app_kwargs(self):
+        return {'default_host': "www.example.com"}
+
+    def test_default_host_matching(self):
+        self.app.add_handlers("www.example.com",
+                              [("/foo", HostMatchingTest.Handler, {"reply": "[0]"})])
+        self.app.add_handlers(r"www\.example\.com",
+                              [("/bar", HostMatchingTest.Handler, {"reply": "[1]"})])
+        self.app.add_handlers("www.test.com",
+                              [("/baz", HostMatchingTest.Handler, {"reply": "[2]"})])
+
+        response = self.fetch("/foo")
+        self.assertEqual(response.body, b"[0]")
+        response = self.fetch("/bar")
+        self.assertEqual(response.body, b"[1]")
+        response = self.fetch("/baz")
+        self.assertEqual(response.code, 404)
+
+        response = self.fetch("/foo", headers={"X-Real-Ip": "127.0.0.1"})
+        self.assertEqual(response.code, 404)
 
         self.app.default_host = "www.test.com"
 
