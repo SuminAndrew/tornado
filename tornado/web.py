@@ -66,6 +66,7 @@ import functools
 import gzip
 import hashlib
 import hmac
+import logging
 import mimetypes
 import numbers
 import os.path
@@ -86,7 +87,7 @@ from tornado import gen
 from tornado import httputil
 from tornado import iostream
 from tornado import locale
-from tornado.log import access_log, app_log, gen_log
+from tornado.log import access_log, app_log, gen_log, ProxyLogger
 from tornado import stack_context
 from tornado import template
 from tornado.escape import utf8, _unicode
@@ -151,6 +152,30 @@ May be overridden by passing a ``min_version`` keyword argument.
 """
 
 
+def _log_record_to_json(record):
+    return {
+        "level": record.levelname,
+        "created": record.created,
+        "pathname": record.pathname,
+        "lineno": record.lineno,
+        "message": record.getMessage(),
+        "exc_info": _exc_info_to_json(record.exc_info)
+    }
+
+
+def _exc_info_to_json(exc_info):
+    pass
+
+
+class DebugLogHandler(logging.Handler):
+    def __init__(self):
+        super(DebugLogHandler, self).__init__()
+        self.records = []
+
+    def handle(self, record):
+        self.records.append(_log_record_to_json(record))
+
+
 class RequestHandler(object):
     """Base class for HTTP request handlers.
 
@@ -189,6 +214,25 @@ class RequestHandler(object):
         self.ui["modules"] = self.ui["_tt_modules"]
         self.clear()
         self.request.connection.set_close_callback(self.on_connection_close)
+
+        self._is_debug_page = self.is_debug_page()
+        self._debug_info = {}
+        self.debug_log_handler = None
+
+        extra = {
+            'request_id': self.application.get_request_id(self.request)
+        }
+
+        self.gen_log = logging.LoggerAdapter(ProxyLogger(gen_log), extra)
+        self.app_log = logging.LoggerAdapter(ProxyLogger(app_log), extra)
+        self.access_log = logging.LoggerAdapter(ProxyLogger(access_log), extra)
+
+        if self._is_debug_page:
+            self.debug_log_handler = DebugLogHandler()
+            self.gen_log.logger.addHandler(self.debug_log_handler)
+            self.app_log.logger.addHandler(self.debug_log_handler)
+            self.access_log.logger.addHandler(self.debug_log_handler)
+
         self.initialize(**kwargs)
 
     def initialize(self):
@@ -216,6 +260,16 @@ class RequestHandler(object):
     def settings(self):
         """An alias for `self.application.settings <Application.settings>`."""
         return self.application.settings
+
+    def is_debug_page(self):
+        if not self.settings.get("enable_debug_page"):
+            return False
+
+        debug_param = self.settings.get("debug_param_name")
+        if debug_param is None:
+            return False
+
+        return self.get_argument(debug_param, None) is not None
 
     def head(self, *args, **kwargs):
         raise HTTPError(405)
@@ -940,6 +994,16 @@ class RequestHandler(object):
                 for cookie in self._new_cookie.values():
                     self.add_header("Set-Cookie", cookie.OutputString(None))
 
+            if self._is_debug_page:
+                self._debug_info['status_code'] = self._status_code
+                self._debug_info['reason'] = self._reason
+                self._debug_info['headers'] = dict(self._headers.get_all())
+                self._debug_info['chunks'] = self._debug_info.get('chunks', []) + [chunk]
+                self.app_log.debug('flush called in debug mode')
+                future = Future()
+                future.set_result(None)
+                return future
+
             start_line = httputil.ResponseStartLine('',
                                                     self._status_code,
                                                     self._reason)
@@ -948,13 +1012,21 @@ class RequestHandler(object):
         else:
             for transform in self._transforms:
                 chunk = transform.transform_chunk(chunk, include_footers)
+
             # Ignore the chunk and only write the headers for HEAD requests
-            if self.request.method != "HEAD":
-                return self.request.connection.write(chunk, callback=callback)
-            else:
+            if self.request.method == "HEAD":
                 future = Future()
                 future.set_result(None)
                 return future
+
+            if self._is_debug_page:
+                self._debug_info['chunks'] = self._debug_info.get('chunks', []) + [chunk]
+                self.app_log.debug('flush written to debug')
+                future = Future()
+                future.set_result(None)
+                return future
+
+            return self.request.connection.write(chunk, callback=callback)
 
     def finish(self, chunk=None):
         """Finishes this response, ending the HTTP request."""
@@ -988,7 +1060,12 @@ class RequestHandler(object):
             # are keepalive connections)
             self.request.connection.set_close_callback(None)
 
-        self.flush(include_footers=True)
+        if self._is_debug_page:
+            self._debug_info['chunks'] = self._debug_info.get('chunks', []) + self._write_buffer
+            self._flush_debug_page()
+        else:
+            self.flush(include_footers=True)
+
         self.request.finish()
         self._log()
         self._finished = True
@@ -996,6 +1073,29 @@ class RequestHandler(object):
         # Break up a reference cycle between this handler and the
         # _ui_module closures to allow for faster GC on CPython.
         self.ui = None
+
+    def _flush_debug_page(self):
+        self.clear()
+
+        return self.request.connection.write_headers(
+            httputil.ResponseStartLine('', self._status_code, self._reason),
+            self._headers, self.render_debug_page()
+        )
+
+    def render_debug_page(self):
+        """Renders debug output. Override this method to add templating to your debug page."""
+        self.set_header("Content-Type", "application/json; charset=UTF-8")
+        return utf8(escape.json_encode(self.get_debug_page_data()))
+
+    def get_debug_page_data(self):
+        """Returns the dictionary with all debug data generated during request handling."""
+        debug_data = dict(self._debug_info)
+        debug_data.update({
+            "chunks_base64": [_unicode(base64.b64encode(c)) for c in debug_data.pop("chunks", [])],
+            "logs": self.debug_log_handler.records
+        })
+
+        return debug_data
 
     def send_error(self, status_code=500, **kwargs):
         """Sends the given HTTP error code to the browser.
@@ -1009,7 +1109,7 @@ class RequestHandler(object):
         Additional keyword arguments are passed through to `write_error`.
         """
         if self._headers_written:
-            gen_log.error("Cannot send error response after headers written")
+            self.gen_log.error("Cannot send error response after headers written")
             if not self._finished:
                 # If we get an error between writing headers and finishing,
                 # we are unlikely to be able to finish due to a
@@ -1018,8 +1118,8 @@ class RequestHandler(object):
                 try:
                     self.finish()
                 except Exception:
-                    gen_log.error("Failed to flush partial response",
-                                  exc_info=True)
+                    self.gen_log.error("Failed to flush partial response",
+                                       exc_info=True)
             return
         self.clear()
 
@@ -1032,7 +1132,7 @@ class RequestHandler(object):
         try:
             self.write_error(status_code, **kwargs)
         except Exception:
-            app_log.error("Uncaught exception in write_error", exc_info=True)
+            self.app_log.error("Uncaught exception in write_error", exc_info=True)
         if not self._finished:
             self.finish()
 
@@ -1288,8 +1388,8 @@ class RequestHandler(object):
                 return (version, token, timestamp)
         except Exception:
             # Catch exceptions and return nothing instead of failing.
-            gen_log.debug("Uncaught exception in _decode_xsrf_token",
-                          exc_info=True)
+            self.gen_log.debug("Uncaught exception in _decode_xsrf_token",
+                               exc_info=True)
             return None, None, None
 
     def check_xsrf_cookie(self):
@@ -1512,7 +1612,7 @@ class RequestHandler(object):
             try:
                 self._handle_request_exception(e)
             except Exception:
-                app_log.error("Exception in exception handler", exc_info=True)
+                self.app_log.error("Exception in exception handler", exc_info=True)
             if (self._prepared_future is not None and
                     not self._prepared_future.done()):
                 # In case we failed before setting _prepared_future, do it
@@ -1551,7 +1651,7 @@ class RequestHandler(object):
         except Exception:
             # An error here should still get a best-effort send_error()
             # to avoid leaking the connection.
-            app_log.error("Error in exception logger", exc_info=True)
+            self.app_log.error("Error in exception logger", exc_info=True)
         if self._finished:
             # Extra errors after the request has been finished should
             # be logged, but there is no reason to continue to try and
@@ -1559,7 +1659,7 @@ class RequestHandler(object):
             return
         if isinstance(e, HTTPError):
             if e.status_code not in httputil.responses and not e.reason:
-                gen_log.error("Bad HTTP status code: %d", e.status_code)
+                self.gen_log.error("Bad HTTP status code: %d", e.status_code)
                 self.send_error(500, exc_info=sys.exc_info())
             else:
                 self.send_error(e.status_code, exc_info=sys.exc_info())
@@ -1581,10 +1681,10 @@ class RequestHandler(object):
                 format = "%d %s: " + value.log_message
                 args = ([value.status_code, self._request_summary()] +
                         list(value.args))
-                gen_log.warning(format, *args)
+                self.gen_log.warning(format, *args)
         else:
-            app_log.error("Uncaught exception %s\n%r", self._request_summary(),
-                          self.request, exc_info=(typ, value, tb))
+            self.app_log.error("Uncaught exception %s\n%r", self._request_summary(),
+                               self.request, exc_info=(typ, value, tb))
 
     def _ui_module(self, name, module):
         def render(*args, **kwargs):
@@ -1896,11 +1996,14 @@ class Application(ReversibleRouter):
                 handlers.insert(0, (pattern, static_handler_class,
                                     static_handler_args))
 
-        if self.settings.get('debug'):
-            self.settings.setdefault('autoreload', True)
-            self.settings.setdefault('compiled_template_cache', False)
-            self.settings.setdefault('static_hash_cache', False)
-            self.settings.setdefault('serve_traceback', True)
+        self.request_id_header = settings.get("request_id_header", "X-Request-Id")
+
+        if self.settings.get("debug"):
+            self.settings.setdefault("autoreload", True)
+            self.settings.setdefault("compiled_template_cache", False)
+            self.settings.setdefault("static_hash_cache", False)
+            self.settings.setdefault("serve_traceback", True)
+            self.settings.setdefault("enable_debug_page", True)
 
         self.wildcard_router = _ApplicationRouter(self, handlers)
         self.default_router = _ApplicationRouter(self, [
@@ -2048,14 +2151,20 @@ class Application(ReversibleRouter):
             self.settings["log_function"](handler)
             return
         if handler.get_status() < 400:
-            log_method = access_log.info
+            log_method = handler.access_log.info
         elif handler.get_status() < 500:
-            log_method = access_log.warning
+            log_method = handler.access_log.warning
         else:
-            log_method = access_log.error
+            log_method = handler.access_log.error
         request_time = 1000.0 * handler.request.request_time()
         log_method("%d %s %.2fms", handler.get_status(),
                    handler._request_summary(), request_time)
+
+    def get_request_id(self, request):
+        if self.request_id_header in request.headers:
+            return request.headers[self.request_id_header]
+
+        return str(int(request._start_time * 1000))
 
 
 class _HandlerDelegate(httputil.HTTPMessageDelegate):

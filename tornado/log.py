@@ -67,6 +67,19 @@ def _safe_unicode(s):
         return repr(s)
 
 
+class ProxyLogger(logging.Logger):
+    """Proxies everything to `base_logger`.
+    An instance of `ProxyLogger` can be created for every request and contain request-specific information."""
+    def __init__(self, base_logger):
+        super(ProxyLogger, self).__init__(base_logger.name)
+        self.addHandler(base_logger)
+
+
+class RequestLogger(logging.LoggerAdapter):
+    def __init__(self, base_logger, extra):
+        super(RequestLogger, self).__init__(base_logger, extra)
+
+
 class LogFormatter(logging.Formatter):
     """Log formatter used in Tornado.
 
