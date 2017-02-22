@@ -66,6 +66,7 @@ import functools
 import gzip
 import hashlib
 import hmac
+import logging
 import mimetypes
 import numbers
 import os.path
@@ -189,6 +190,11 @@ class RequestHandler(object):
         self.ui["modules"] = self.ui["_tt_modules"]
         self.clear()
         self.request.connection.set_close_callback(self.on_connection_close)
+
+        self.gen_log = logging.LoggerAdapter(gen_log, {})
+        self.app_log = logging.LoggerAdapter(app_log, {})
+        self.access_log = logging.LoggerAdapter(access_log, {})
+
         self.initialize(**kwargs)
 
     def initialize(self):
@@ -1009,7 +1015,7 @@ class RequestHandler(object):
         Additional keyword arguments are passed through to `write_error`.
         """
         if self._headers_written:
-            gen_log.error("Cannot send error response after headers written")
+            self.gen_log.error("Cannot send error response after headers written")
             if not self._finished:
                 # If we get an error between writing headers and finishing,
                 # we are unlikely to be able to finish due to a
@@ -1018,8 +1024,8 @@ class RequestHandler(object):
                 try:
                     self.finish()
                 except Exception:
-                    gen_log.error("Failed to flush partial response",
-                                  exc_info=True)
+                    self.gen_log.error("Failed to flush partial response",
+                                       exc_info=True)
             return
         self.clear()
 
@@ -1032,7 +1038,7 @@ class RequestHandler(object):
         try:
             self.write_error(status_code, **kwargs)
         except Exception:
-            app_log.error("Uncaught exception in write_error", exc_info=True)
+            self.app_log.error("Uncaught exception in write_error", exc_info=True)
         if not self._finished:
             self.finish()
 
@@ -1288,8 +1294,8 @@ class RequestHandler(object):
                 return (version, token, timestamp)
         except Exception:
             # Catch exceptions and return nothing instead of failing.
-            gen_log.debug("Uncaught exception in _decode_xsrf_token",
-                          exc_info=True)
+            self.gen_log.debug("Uncaught exception in _decode_xsrf_token",
+                               exc_info=True)
             return None, None, None
 
     def check_xsrf_cookie(self):
@@ -1512,7 +1518,7 @@ class RequestHandler(object):
             try:
                 self._handle_request_exception(e)
             except Exception:
-                app_log.error("Exception in exception handler", exc_info=True)
+                self.app_log.error("Exception in exception handler", exc_info=True)
             if (self._prepared_future is not None and
                     not self._prepared_future.done()):
                 # In case we failed before setting _prepared_future, do it
@@ -1551,7 +1557,7 @@ class RequestHandler(object):
         except Exception:
             # An error here should still get a best-effort send_error()
             # to avoid leaking the connection.
-            app_log.error("Error in exception logger", exc_info=True)
+            self.app_log.error("Error in exception logger", exc_info=True)
         if self._finished:
             # Extra errors after the request has been finished should
             # be logged, but there is no reason to continue to try and
@@ -1559,7 +1565,7 @@ class RequestHandler(object):
             return
         if isinstance(e, HTTPError):
             if e.status_code not in httputil.responses and not e.reason:
-                gen_log.error("Bad HTTP status code: %d", e.status_code)
+                self.gen_log.error("Bad HTTP status code: %d", e.status_code)
                 self.send_error(500, exc_info=sys.exc_info())
             else:
                 self.send_error(e.status_code, exc_info=sys.exc_info())
@@ -1581,10 +1587,10 @@ class RequestHandler(object):
                 format = "%d %s: " + value.log_message
                 args = ([value.status_code, self._request_summary()] +
                         list(value.args))
-                gen_log.warning(format, *args)
+                self.gen_log.warning(format, *args)
         else:
-            app_log.error("Uncaught exception %s\n%r", self._request_summary(),
-                          self.request, exc_info=(typ, value, tb))
+            self.app_log.error("Uncaught exception %s\n%r", self._request_summary(),
+                               self.request, exc_info=(typ, value, tb))
 
     def _ui_module(self, name, module):
         def render(*args, **kwargs):
@@ -2048,11 +2054,11 @@ class Application(ReversibleRouter):
             self.settings["log_function"](handler)
             return
         if handler.get_status() < 400:
-            log_method = access_log.info
+            log_method = handler.access_log.info
         elif handler.get_status() < 500:
-            log_method = access_log.warning
+            log_method = handler.access_log.warning
         else:
-            log_method = access_log.error
+            log_method = handler.access_log.error
         request_time = 1000.0 * handler.request.request_time()
         log_method("%d %s %.2fms", handler.get_status(),
                    handler._request_summary(), request_time)
