@@ -50,6 +50,15 @@ else:
 # Reference it so pyflakes doesn't complain.
 responses
 
+if not PY3:
+    responses.update({
+        428: 'Precondition Required',
+        429: 'Too Many Requests',
+        431: 'Request Header Fields Too Large',
+
+        511: 'Network Authentication Required',
+    })
+
 try:
     from ssl import SSLError
 except ImportError:
